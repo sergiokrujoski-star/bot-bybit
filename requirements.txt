@@ -1,4 +1,4 @@
 pybit
 pandas
-pandas_ta
 requests
+pandas-ta-quantstats
