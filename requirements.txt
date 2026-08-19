@@ -1,0 +1,4 @@
+pybit
+pandas
+pandas_ta
+requests
