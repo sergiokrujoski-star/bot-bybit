@@ -1,20 +1,32 @@
+import os
+import threading
 import time
+from flask import Flask
 import pandas as pd
 import pandas_ta as ta
 import requests
 from pybit.unified_trading import HTTP
 
 # ==========================================
-# 1. CREDENCIALES Y CONFIGURACIÓN
+# SERVIDOR FLASK (PARA MANTENER RENDER ACTIVO)
 # ==========================================
-API_KEY = 'IokH48VokxgRPmcAQq'
-SECRET_KEY = 'MyZFKwbP8HS9L9MiY6xfnk40SH03brax7TZc'
+app = Flask(__name__)
 
-# Credenciales de Telegram
-TELEGRAM_TOKEN = "8925880927:AAEuXnLMypu0CitJ5QQPcegBUVUXQxm0QwM"
-TELEGRAM_CHAT_ID = "5410664432"
+@app.route('/')
+def health_check():
+    return "Bot de Trading Bybit activo 24/7", 200
 
-# Conexión al entorno Demo Trading de Bybit
+# ==========================================
+# 1. CREDENCIALES Y CONFIGURACIÓN (VARIABLES DE ENTORNO)
+# ==========================================
+API_KEY = os.getenv('BYBIT_API_KEY')
+SECRET_KEY = os.getenv('BYBIT_SECRET_KEY')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
+
+SYMBOL = 'BTCUSDT'
+LEVERAGE = '2'
+
 session = HTTP(
     demo=True,
     api_key=API_KEY,
@@ -22,14 +34,14 @@ session = HTTP(
     recv_window=10000
 )
 
-SYMBOL = 'BTCUSDT'
-LEVERAGE = '2'
-
 # ==========================================
 # 2. FUNCIÓN DE NOTIFICACIÓN TELEGRAM
 # ==========================================
 def enviar_alerta_telegram(mensaje):
-    """Envía un mensaje a Telegram e imprime errores si las credenciales fallan."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("⚠️ Faltan credenciales de Telegram.")
+        return
+        
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -43,7 +55,7 @@ def enviar_alerta_telegram(mensaje):
     except Exception as e:
         print(f"Error al enviar mensaje a Telegram: {e}")
 
-# Ajustar apalancamiento a 2x
+# Configurar apalancamiento al iniciar
 try:
     session.set_leverage(
         category="linear",
@@ -59,7 +71,6 @@ except Exception as e:
 # 3. OBTENCIÓN DE DATOS E INDICADORES
 # ==========================================
 def obtener_datos_e_indicadores():
-    # Velas de 1 hora (intervalo '60')
     response = session.get_kline(
         category="linear",
         symbol=SYMBOL,
@@ -89,12 +100,11 @@ def obtener_datos_e_indicadores():
     return df
 
 # ==========================================
-# 4. BUCLE PRINCIPAL DE EJECUCIÓN
+# 4. BUCLE PRINCIPAL DEL BOT
 # ==========================================
 def ejecutar_bot():
     print("Bot iniciado correctamente. Monitoreando Bybit Testnet...\n")
     
-    # Notificación al arrancar el script
     enviar_alerta_telegram(
         f"🟢 *Bot de Trading Iniciado*\n"
         f"• *Entorno:* Bybit Demo / Testnet\n"
@@ -146,7 +156,6 @@ def ejecutar_bot():
                 price < low[-2]
             )
 
-            # Consultar posición activa
             positions = session.get_positions(category="linear", symbol=SYMBOL)
             pos_size = float(positions['result']['list'][0]['size'])
 
@@ -155,14 +164,10 @@ def ejecutar_bot():
             if pos_size == 0:
                 if cond_long:
                     print("--> Entrada LONG detectada. Enviando orden...")
-                    
-                    # 1. Enviar orden a la Demo
                     session.place_order(
                         category="linear", symbol=SYMBOL, side="Buy",
                         orderType="Market", qty="0.01"
                     )
-                    
-                    # 2. Notificación por Telegram
                     mensaje_long = (
                         f"🚨 *ENTRADA LONG DETECTADA (DEMO)* 🚨\n\n"
                         f"• *Par:* {SYMBOL}\n"
@@ -174,14 +179,10 @@ def ejecutar_bot():
 
                 elif cond_short:
                     print("--> Entrada SHORT detectada. Enviando orden...")
-                    
-                    # 1. Enviar orden a la Demo
                     session.place_order(
                         category="linear", symbol=SYMBOL, side="Sell",
                         orderType="Market", qty="0.01"
                     )
-                    
-                    # 2. Notificación por Telegram
                     mensaje_short = (
                         f"🚨 *ENTRADA SHORT DETECTADA (DEMO)* 🚨\n\n"
                         f"• *Par:* {SYMBOL}\n"
@@ -191,12 +192,19 @@ def ejecutar_bot():
                     )
                     enviar_alerta_telegram(mensaje_short)
 
-            # Revisa cada 15 minutos
             time.sleep(900)
 
         except Exception as e:
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Error en ejecución: {e}. Reintentando en 15 segundos...")
             time.sleep(15)
 
+# ==========================================
+# INICIO DE HILOS Y SERVIDOR
+# ==========================================
 if __name__ == '__main__':
-    ejecutar_bot()
+    bot_thread = threading.Thread(target=ejecutar_bot)
+    bot_thread.daemon = True
+    bot_thread.start()
+
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
