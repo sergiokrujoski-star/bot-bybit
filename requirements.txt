@@ -1,4 +1,6 @@
-pybit
+flask
+gunicorn
 pandas
+pandas_ta
 requests
-pandas-ta
+pybit
