@@ -8,7 +8,7 @@ import requests
 from pybit.unified_trading import HTTP
 
 # ==========================================
-# SERVIDOR FLASK (PARA MANTENER RENDER ACTIVO)
+# SERVIDOR FLASK (MANTENER RENDER ACTIVO)
 # ==========================================
 app = Flask(__name__)
 
@@ -108,7 +108,7 @@ def obtener_datos_e_indicadores():
     df["plus_di"] = dmi_df["DMP_14"]
     df["minus_di"] = dmi_df["DMN_14"]
 
-    # Cálculo de variación porcentual en 24 horas (24 velas de 1 hora)
+    # Variación porcentual en las últimas 24 horas (24 velas de 1h)
     df["change_24h"] = df["Close"].pct_change(periods=24) * 100
 
     return df
@@ -131,7 +131,7 @@ def ejecutar_bot():
         try:
             df = obtener_datos_e_indicadores()
 
-            # Tomamos la última vela para la lectura
+            # Datos de la última vela
             price = df["Close"].iloc[-1]
             ma5 = df["ma5"].values
             ma10 = df["ma10"].values
@@ -152,13 +152,13 @@ def ejecutar_bot():
                 ma5[-2] > ma10[-2] and ma5[-1] < ma10[-1]
             ) or (ma5[-2] > ma20[-2] and ma5[-1] < ma20[-1])
 
-            # Condición LONG (Entra por Cruce O por Subida >= 2.0%)
+            # Condición LONG (Permite cruce O variación >= 2.0%)
             cond_long = (
                 price > ma200[-1]
                 and (cruce_bullish or change_24h >= 2.0)
                 and ma5[-1] > ma20[-1]
                 and plus_di[-1] > minus_di[-1]
-                and rsi[-1] >= 45  # Permite subidas fuertes sin techo de 70
+                and rsi[-1] >= 45
             )
 
             # Condición SHORT
@@ -170,7 +170,7 @@ def ejecutar_bot():
                 and rsi[-1] <= 55
             )
 
-            # TABLERO DE CONTROL EN CONSOLA (DIAGNÓSTICO)
+            # TABLERO DE DIAGNÓSTICO EN CONSOLA
             print("\n--------------------------------------------------")
             print(
                 f"⏰ Hora: {time.strftime('%H:%M:%S')} | BTC: ${price:,.2f}"
@@ -227,14 +227,15 @@ def ejecutar_bot():
                     )
                     enviar_alerta_telegram(mensaje_short)
 
-            # Revisa el mercado cada 60 segundos
+            # Espera 60 segundos entre consultas para evitar bloqueos
             time.sleep(60)
 
         except Exception as e:
+            # Pausa de seguridad de 5 minutos si ocurre un error de red o límite de API
             print(
-                f"❌ Error en ejecución: {e}. Reintentando en 15 segundos..."
+                f"❌ Error en ejecución: {e}. Esperando 5 minutos para liberar Rate Limit..."
             )
-            time.sleep(15)
+            time.sleep(300)
 
 
 # ==========================================
