@@ -1,250 +1,148 @@
 import os
-import threading
 import time
-from flask import Flask
+import threading
+import requests
 import pandas as pd
 import pandas_ta as ta
-import requests
+from flask import Flask
 from pybit.unified_trading import HTTP
 
-# ==========================================
-# SERVIDOR FLASK (MANTENER RENDER ACTIVO)
-# ==========================================
+# ==================================================
+# 1. SERVIDOR FLASK (PARA RENDER Y CRON JOB)
+# ==================================================
 app = Flask(__name__)
 
+@app.route('/')
+def home():
+    return "Bot de Trading activo y respondiendo.", 200
 
-@app.route("/")
-def health_check():
-    return "Bot de Trading Bybit activo 24/7", 200
+# ==================================================
+# 2. CONFIGURACIÓN DE APIS Y VARIABLES DE ENTORNO
+# ==================================================
+API_KEY = os.environ.get("BYBIT_API_KEY", "")
+SECRET_KEY = os.environ.get("BYBIT_SECRET_KEY", "")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-
-# ==========================================
-# 1. CREDENCIALES Y CONFIGURACIÓN
-# ==========================================
-API_KEY = os.getenv("BYBIT_API_KEY")
-SECRET_KEY = os.getenv("BYBIT_SECRET_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-SYMBOL = "BTCUSDT"
-LEVERAGE = "2"
-
+# Inicialización de cliente Bybit (Mainnet)
 session = HTTP(
-    demo=True, api_key=API_KEY, api_secret=SECRET_KEY, recv_window=10000
+    testnet=False,
+    api_key=API_KEY,
+    api_secret=SECRET_KEY
 )
 
+def enviar_telegram(mensaje):
+    """Envía alertas a tu chat de Telegram."""
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje}
+        try:
+            requests.post(url, json=payload, timeout=5)
+        except Exception as e:
+            print(f"Error enviando mensaje a Telegram: {e}")
 
-# ==========================================
-# 2. FUNCIÓN DE NOTIFICACIÓN TELEGRAM
-# ==========================================
-def enviar_alerta_telegram(mensaje):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ Faltan credenciales de Telegram.")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": mensaje,
-        "parse_mode": "Markdown",
-    }
+# ==================================================
+# 3. LÓGICA DE INDICADORES Y MERCADO (PÚBLICA)
+# ==================================================
+def obtener_datos_mercado(symbol="BTCUSDT"):
+    """
+    Obtiene Velas de 15m y Ticker de 24h usando endpoints públicos.
+    Evita bloqueos de IP/Autenticación.
+    """
     try:
-        res = requests.post(url, json=payload, timeout=5)
-        if res.status_code != 200:
-            print(f"⚠️ Error de Telegram ({res.status_code}): {res.text}")
+        # Obtener Velas (Klines)
+        klines = session.get_kline(category="linear", symbol=symbol, interval="15", limit=100)
+        list_klines = klines['result']['list']
+        
+        df = pd.DataFrame(list_klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
+        df = df.iloc[::-1].reset_index(drop=True)
+        df['close'] = df['close'].astype(float)
+        df['high'] = df['high'].astype(float)
+        df['low'] = df['low'].astype(float)
+        
+        # Calcular EMA 9 y EMA 21
+        df['ema_fast'] = ta.ema(df['close'], length=9)
+        df['ema_slow'] = ta.ema(df['close'], length=21)
+        
+        # Calcular RSI
+        df['rsi'] = ta.rsi(df['close'], length=14)
+        
+        # Calcular ADX
+        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
+        df['adx'] = adx_df['ADX_14']
+        
+        # Obtener Ticker de 24 horas (Para precio actual y variación %)
+        ticker = session.get_tickers(category="linear", symbol=symbol)
+        ticker_data = ticker['result']['list'][0]
+        
+        precio_actual = float(ticker_data['lastPrice'])
+        price_24h_pcnt = float(ticker_data['price24hPcnt']) * 100 # Convertir a Porcentaje
+        
+        return df, precio_actual, price_24h_pcnt
     except Exception as e:
-        print(f"Error al enviar mensaje a Telegram: {e}")
+        print(f"Error al obtener datos del mercado: {e}")
+        return None, None, None
 
-
-# Configurar apalancamiento al iniciar
-try:
-    session.set_leverage(
-        category="linear",
-        symbol=SYMBOL,
-        buyLeverage=LEVERAGE,
-        sellLeverage=LEVERAGE,
-    )
-    print(f"Apalancamiento ajustado a {LEVERAGE}x en Bybit Demo.")
-except Exception as e:
-    print(f"Aviso sobre apalancamiento: {e}")
-
-
-# ==========================================
-# 3. OBTENCIÓN DE DATOS E INDICADORES
-# ==========================================
-def obtener_datos_e_indicadores():
-    response = session.get_kline(
-        category="linear", symbol=SYMBOL, interval="60", limit=200
-    )
-
-    klines = response["result"]["list"]
-    df = pd.DataFrame(
-        klines,
-        columns=[
-            "timestamp",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Volume",
-            "Turnover",
-        ],
-    )
-    df = df.iloc[::-1].reset_index(drop=True)
-
-    df["Close"] = df["Close"].astype(float)
-    df["High"] = df["High"].astype(float)
-    df["Low"] = df["Low"].astype(float)
-
-    # Indicadores técnicos
-    df["ma5"] = ta.sma(df["Close"], length=5)
-    df["ma10"] = ta.sma(df["Close"], length=10)
-    df["ma20"] = ta.sma(df["Close"], length=20)
-    df["ma200"] = ta.sma(df["Close"], length=200)
-    df["rsi"] = ta.rsi(df["Close"], length=14)
-
-    dmi_df = ta.adx(df["High"], df["Low"], df["Close"], length=14)
-    df["adx"] = dmi_df["ADX_14"]
-    df["plus_di"] = dmi_df["DMP_14"]
-    df["minus_di"] = dmi_df["DMN_14"]
-
-    # Variación porcentual en las últimas 24 horas (24 velas de 1h)
-    df["change_24h"] = df["Close"].pct_change(periods=24) * 100
-
-    return df
-
-
-# ==========================================
-# 4. BUCLE PRINCIPAL DEL BOT
-# ==========================================
+# ==================================================
+# 4. BUCLE PRINCIPAL DE TRADING EN SEGUNDO PLANO
+# ==================================================
 def ejecutar_bot():
-    print("Bot iniciado correctamente. Monitoreando Bybit Testnet...\n")
-
-    enviar_alerta_telegram(
-        f"🟢 *Bot de Trading Iniciado*\n"
-        f"• *Entorno:* Bybit Demo / Testnet\n"
-        f"• *Par:* {SYMBOL}\n"
-        f"• *Temporalidad:* 1 Hora"
-    )
-
+    print("🤖 Iniciando hilo de ejecución del Bot...")
+    enviar_telegram("🚀 Bot de Trading en vivo iniciado correctamente.")
+    
     while True:
         try:
-            df = obtener_datos_e_indicadores()
-
-            # Datos de la última vela
-            price = df["Close"].iloc[-1]
-            ma5 = df["ma5"].values
-            ma10 = df["ma10"].values
-            ma20 = df["ma20"].values
-            ma200 = df["ma200"].values
-            rsi = df["rsi"].values
-            adx = df["adx"].values
-            plus_di = df["plus_di"].values
-            minus_di = df["minus_di"].values
-            change_24h = df["change_24h"].iloc[-1]
-
-            # Verificación de cruces
-            cruce_bullish = (
-                ma5[-2] < ma10[-2] and ma5[-1] > ma10[-1]
-            ) or (ma5[-2] < ma20[-2] and ma5[-1] > ma20[-1])
-
-            cruce_bearish = (
-                ma5[-2] > ma10[-2] and ma5[-1] < ma10[-1]
-            ) or (ma5[-2] > ma20[-2] and ma5[-1] < ma20[-1])
-
-            # Condición LONG (Permite cruce O variación >= 2.0%)
-            cond_long = (
-                price > ma200[-1]
-                and (cruce_bullish or change_24h >= 2.0)
-                and ma5[-1] > ma20[-1]
-                and plus_di[-1] > minus_di[-1]
-                and rsi[-1] >= 45
-            )
-
-            # Condición SHORT
-            cond_short = (
-                price < ma200[-1]
-                and (cruce_bearish or change_24h <= -2.0)
-                and ma5[-1] < ma20[-1]
-                and minus_di[-1] > plus_di[-1]
-                and rsi[-1] <= 55
-            )
-
-            # TABLERO DE DIAGNÓSTICO EN CONSOLA
-            print("\n--------------------------------------------------")
-            print(
-                f"⏰ Hora: {time.strftime('%H:%M:%S')} | BTC: ${price:,.2f}"
-            )
-            print(
-                f"📈 Var. 24h: {change_24h:.2f}% (¿>= 2%?: {change_24h >= 2.0})"
-            )
-            print(f"⚔️ Cruce Bullish: {cruce_bullish}")
-            print(f"📊 RSI: {rsi[-1]:.1f} | ADX: {adx[-1]:.1f}")
-            print(f"🎯 ¿Activa LONG?: {cond_long}")
-            print("--------------------------------------------------\n")
-
-            positions = session.get_positions(
-                category="linear", symbol=SYMBOL
-            )
-            pos_size = float(positions["result"]["list"][0]["size"])
-
-            if pos_size == 0:
-                if cond_long:
-                    print("🚀 Entrada LONG detectada. Enviando orden...")
-                    session.place_order(
-                        category="linear",
-                        symbol=SYMBOL,
-                        side="Buy",
-                        orderType="Market",
-                        qty="0.01",
-                    )
-                    mensaje_long = (
-                        f"🚨 *ENTRADA LONG DETECTADA (DEMO)* 🚨\n\n"
-                        f"• *Par:* {SYMBOL}\n"
-                        f"• *Precio:* ${price:,.2f}\n"
-                        f"• *Variación 24h:* {change_24h:.2f}%\n"
-                        f"• *RSI:* {rsi[-1]:.2f} | *ADX:* {adx[-1]:.2f}\n"
-                        f"• *Orden:* Buy Market (0.01 BTC)"
-                    )
-                    enviar_alerta_telegram(mensaje_long)
-
-                elif cond_short:
-                    print("🔻 Entrada SHORT detectada. Enviando orden...")
-                    session.place_order(
-                        category="linear",
-                        symbol=SYMBOL,
-                        side="Sell",
-                        orderType="Market",
-                        qty="0.01",
-                    )
-                    mensaje_short = (
-                        f"🚨 *ENTRADA SHORT DETECTADA (DEMO)* 🚨\n\n"
-                        f"• *Par:* {SYMBOL}\n"
-                        f"• *Precio:* ${price:,.2f}\n"
-                        f"• *Variación 24h:* {change_24h:.2f}%\n"
-                        f"• *RSI:* {rsi[-1]:.2f} | *ADX:* {adx[-1]:.2f}\n"
-                        f"• *Orden:* Sell Market (0.01 BTC)"
-                    )
-                    enviar_alerta_telegram(mensaje_short)
-
-            # Espera 60 segundos entre consultas para evitar bloqueos
-            time.sleep(60)
-
+            df, precio_actual, var_24h = obtener_datos_mercado("BTCUSDT")
+            
+            if df is not None and not df.empty:
+                # Últimos valores calculados
+                cruz_ema_fast = df['ema_fast'].iloc[-1]
+                cruz_ema_slow = df['ema_slow'].iloc[-1]
+                cruz_ema_fast_prev = df['ema_fast'].iloc[-2]
+                cruz_ema_slow_prev = df['ema_slow'].iloc[-2]
+                
+                rsi_actual = df['rsi'].iloc[-1]
+                adx_actual = df['adx'].iloc[-1]
+                
+                # Condición de Cruce Alcista (EMA 9 cruza hacia arriba EMA 21)
+                cruce_bullish = (cruz_ema_fast_prev <= cruz_ema_slow_prev) and (cruz_ema_fast > cruz_ema_slow)
+                
+                # Condición de Variación >= 2%
+                cumple_variacion = var_24h >= 2.0
+                
+                # Evaluación general de entrada LONG
+                activa_long = cumple_variacion and cruce_bullish and (rsi_actual > 50) and (adx_actual > 20)
+                
+                # TABLERO DE CONTROL EN CONSOLA (Render Logs)
+                hora_actual = time.strftime("%H:%M:%S", time.localtime())
+                print("\n--------------------------------------------------")
+                print(f"⏰ Hora: {hora_actual} | BTC: ${precio_actual:,.2f}")
+                print(f"📈 Var. 24h: {var_24h:.2f}% (¿>= 2%?: {cumple_variacion})")
+                print(f"⚔️ Cruce Bullish: {cruce_bullish}")
+                print(f"📊 RSI: {rsi_actual:.1f} | ADX: {adx_actual:.1f}")
+                print(f"🎯 ¿Activa LONG?: {activa_long}")
+                print("--------------------------------------------------")
+                
+                # Ejecución de orden (Si cumple las condiciones)
+                if activa_long:
+                    msg = f"🔥 ¡SEÑAL LONG DETECTADA!\nBTC: ${precio_actual}\nVar 24h: {var_24h:.2f}%\nRSI: {rsi_actual:.1f} | ADX: {adx_actual:.1f}"
+                    print(msg)
+                    enviar_telegram(msg)
+                    # Aquí va la ejecución de la orden con Bybit si aplica
+                    
         except Exception as e:
-            # Pausa de seguridad de 5 minutos si ocurre un error de red o límite de API
-            print(
-                f"❌ Error en ejecución: {e}. Esperando 5 minutos para liberar Rate Limit..."
-            )
-            time.sleep(300)
+            print(f"Error en el bucle principal: {e}")
+            
+        time.sleep(60) # Consulta cada 60 segundos
 
+# ==================================================
+# 5. INICIALIZACIÓN DE HILO Y SERVIDOR
+# ==================================================
+# Iniciar el bot en un hilo separado
+thread = threading.Thread(target=ejecutar_bot, daemon=True)
+thread.start()
 
-# ==========================================
-# INICIO DE HILOS Y SERVIDOR
-# ==========================================
 if __name__ == "__main__":
-    bot_thread = threading.Thread(target=ejecutar_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
-
-    port = int(os.environ.get("PORT", 5000))
+    # Toma el puerto asignado por Render dinámicamente
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
