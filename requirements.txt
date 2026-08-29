@@ -1,6 +1,4 @@
-flask
-gunicorn
+ccxt
 pandas
-pandas_ta
-requests
-pybit
+pandas-ta
+python-dotenv
