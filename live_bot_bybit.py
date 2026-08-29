@@ -2,7 +2,8 @@ import os
 import time
 import ccxt
 import pandas as pd
-import pandas_ta as ta
+import numpy as np
+import ta
 from datetime import datetime, timezone
 
 # ------------------------------------------------------------------
@@ -19,12 +20,12 @@ exchange = ccxt.bybit({
     'options': {'defaultType': 'future'}
 })
 
-# Descomentar para usar en entorno real / Comentar para Testnet
-exchange.set_sandbox_mode(True)  # Activa modo Testnet (Demo)
+# Activa modo Testnet (Demo)
+exchange.set_sandbox_mode(True)
 
 SYMBOL = 'BTC/USDT:USDT'
 TIMEFRAME = '15m'
-LEVERAGE = 1  # Apalancamiento 1x
+LEVERAGE = 1
 MONTO_USDT = 50.0  # Tamaño de posición en USDT
 
 TP_PCT = 0.018  # Take Profit 1.8%
@@ -43,13 +44,11 @@ def obtener_datos_mercado():
         for col in ['open', 'high', 'low', 'close']:
             df[col] = df[col].astype(float)
             
-        # Indicadores
-        df['ema_fast'] = ta.ema(df['close'], length=9)
-        df['ema_slow'] = ta.ema(df['close'], length=21)
-        df['rsi'] = ta.rsi(df['close'], length=14)
-        
-        adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-        df['adx'] = adx_df['ADX_14'] if adx_df is not None and 'ADX_14' in adx_df.columns else 20
+        # Indicadores usando la librería 'ta'
+        df['ema_fast'] = ta.trend.ema_indicator(df['close'], window=9)
+        df['ema_slow'] = ta.trend.ema_indicator(df['close'], window=21)
+        df['rsi'] = ta.momentum.rsi(df['close'], window=14)
+        df['adx'] = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
         
         # Variación de 1h (4 velas de 15m)
         df['var_1h'] = ((df['close'] - df['close'].shift(4)) / df['close'].shift(4)) * 100
@@ -69,7 +68,7 @@ def verificar_posicion_abierta():
         return False
     except Exception as e:
         print(f"⚠️ Error consultando posiciones: {e}")
-        return True  # Por seguridad, asumimos True si la API falla
+        return True
 
 def ejecutar_orden_long(precio_actual):
     """Ejecuta una orden de entrada en LONG con TP y SL adjuntos."""
@@ -80,13 +79,11 @@ def ejecutar_orden_long(precio_actual):
         
         print(f"🚀 Ejecutando LONG: {cantidad_btc} BTC | Entrada: {precio_actual} | TP: {tp_price} | SL: {sl_price}")
         
-        # Ajustar apalancamiento
         try:
             exchange.set_leverage(LEVERAGE, SYMBOL)
         except Exception:
             pass
 
-        # Orden de Mercado con TP y SL acoplados
         params = {
             'takeProfit': str(tp_price),
             'stopLoss': str(sl_price)
@@ -111,7 +108,7 @@ def ejecutar_bot():
             if df is not None and len(df) > 0:
                 ultima = df.iloc[-1]
                 
-                # Evaluación de condiciones para Entrada LONG
+                # Evaluación de condiciones LONG
                 long_signal = (
                     (ultima['var_1h'] >= 1.0) and 
                     (ultima['ema_fast'] > ultima['ema_slow']) and 
@@ -121,13 +118,12 @@ def ejecutar_bot():
                 
                 posicion_activa = verificar_posicion_abierta()
                 
-                print(f"[{ahora}] Precio: {ultima['close']} | Var 1h: {ultima['var_1h']:.2f}% | RSI: {ultima['rsi']:.1f} | Posición Activa: {posicion_activa}")
+                print(f"[{ahora}] Precio: {ultima['close']} | Var 1h: {ultima['var_1h']:.2f}% | RSI: {ultima['rsi']:.1f} | ADX: {ultima['adx']:.1f} | Posición Activa: {posicion_activa}")
                 
                 if long_signal and not posicion_activa:
                     print("🎯 Señal detectada. Preparando orden...")
                     ejecutar_orden_long(ultima['close'])
                 
-            # Esperar 60 segundos antes de la siguiente verificación
             time.sleep(60)
             
         except Exception as e:
