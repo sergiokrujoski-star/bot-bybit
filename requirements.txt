@@ -1,5 +1,4 @@
-ccxt
+flask
+pybit
 pandas
-numpy
-ta
-python-dotenv
+requests
