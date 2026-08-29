@@ -1,148 +1,138 @@
 import os
 import time
-import threading
-import requests
+import ccxt
 import pandas as pd
 import pandas_ta as ta
-from flask import Flask
-from pybit.unified_trading import HTTP
+from datetime import datetime, timezone
 
-# ==================================================
-# 1. SERVIDOR FLASK (PARA RENDER Y CRON JOB)
-# ==================================================
-app = Flask(__name__)
+# ------------------------------------------------------------------
+# CONFIGURACIÓN DE PARÁMETROS Y CLAVES (Variables de Entorno)
+# ------------------------------------------------------------------
+API_KEY = os.getenv('BYBIT_API_KEY', '')
+API_SECRET = os.getenv('BYBIT_API_SECRET', '')
 
-@app.route('/')
-def home():
-    return "Bot de Trading activo y respondiendo.", 200
+# Inicializar Exchange (Bybit Demo / Testnet)
+exchange = ccxt.bybit({
+    'apiKey': API_KEY,
+    'secret': API_SECRET,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'}
+})
 
-# ==================================================
-# 2. CONFIGURACIÓN DE APIS Y VARIABLES DE ENTORNO
-# ==================================================
-API_KEY = os.environ.get("BYBIT_API_KEY", "")
-SECRET_KEY = os.environ.get("BYBIT_SECRET_KEY", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+# Descomentar para usar en entorno real / Comentar para Testnet
+exchange.set_sandbox_mode(True)  # Activa modo Testnet (Demo)
 
-# Inicialización de cliente Bybit (Mainnet)
-session = HTTP(
-    testnet=False,
-    api_key=API_KEY,
-    api_secret=SECRET_KEY
-)
+SYMBOL = 'BTC/USDT:USDT'
+TIMEFRAME = '15m'
+LEVERAGE = 1  # Apalancamiento 1x
+MONTO_USDT = 50.0  # Tamaño de posición en USDT
 
-def enviar_telegram(mensaje):
-    """Envía alertas a tu chat de Telegram."""
-    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": mensaje}
-        try:
-            requests.post(url, json=payload, timeout=5)
-        except Exception as e:
-            print(f"Error enviando mensaje a Telegram: {e}")
+TP_PCT = 0.018  # Take Profit 1.8%
+SL_PCT = 0.010  # Stop Loss 1.0%
 
-# ==================================================
-# 3. LÓGICA DE INDICADORES Y MERCADO (PÚBLICA)
-# ==================================================
-def obtener_datos_mercado(symbol="BTCUSDT"):
-    """
-    Obtiene Velas de 15m y Ticker de 24h usando endpoints públicos.
-    Evita bloqueos de IP/Autenticación.
-    """
+# ------------------------------------------------------------------
+# FUNCIONES AUXILIARES
+# ------------------------------------------------------------------
+def obtener_datos_mercado():
+    """Descarga las últimas velas e ingresa los indicadores técnicos."""
     try:
-        # Obtener Velas (Klines)
-        klines = session.get_kline(category="linear", symbol=symbol, interval="15", limit=100)
-        list_klines = klines['result']['list']
+        ohlcv = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=100)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         
-        df = pd.DataFrame(list_klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'turnover'])
-        df = df.iloc[::-1].reset_index(drop=True)
-        df['close'] = df['close'].astype(float)
-        df['high'] = df['high'].astype(float)
-        df['low'] = df['low'].astype(float)
-        
-        # Calcular EMA 9 y EMA 21
+        for col in ['open', 'high', 'low', 'close']:
+            df[col] = df[col].astype(float)
+            
+        # Indicadores
         df['ema_fast'] = ta.ema(df['close'], length=9)
         df['ema_slow'] = ta.ema(df['close'], length=21)
-        
-        # Calcular RSI
         df['rsi'] = ta.rsi(df['close'], length=14)
         
-        # Calcular ADX
         adx_df = ta.adx(df['high'], df['low'], df['close'], length=14)
-        df['adx'] = adx_df['ADX_14']
+        df['adx'] = adx_df['ADX_14'] if adx_df is not None and 'ADX_14' in adx_df.columns else 20
         
-        # Obtener Ticker de 24 horas (Para precio actual y variación %)
-        ticker = session.get_tickers(category="linear", symbol=symbol)
-        ticker_data = ticker['result']['list'][0]
+        # Variación de 1h (4 velas de 15m)
+        df['var_1h'] = ((df['close'] - df['close'].shift(4)) / df['close'].shift(4)) * 100
         
-        precio_actual = float(ticker_data['lastPrice'])
-        price_24h_pcnt = float(ticker_data['price24hPcnt']) * 100 # Convertir a Porcentaje
-        
-        return df, precio_actual, price_24h_pcnt
+        return df
     except Exception as e:
-        print(f"Error al obtener datos del mercado: {e}")
-        return None, None, None
+        print(f"⚠️ Error obteniendo datos de mercado: {e}")
+        return None
 
-# ==================================================
-# 4. BUCLE PRINCIPAL DE TRADING EN SEGUNDO PLANO
-# ==================================================
+def verificar_posicion_abierta():
+    """Consulta si actualmente hay una posición LONG activa."""
+    try:
+        positions = exchange.fetch_positions([SYMBOL])
+        for pos in positions:
+            if float(pos['contracts']) > 0 and pos['side'].lower() == 'long':
+                return True
+        return False
+    except Exception as e:
+        print(f"⚠️ Error consultando posiciones: {e}")
+        return True  # Por seguridad, asumimos True si la API falla
+
+def ejecutar_orden_long(precio_actual):
+    """Ejecuta una orden de entrada en LONG con TP y SL adjuntos."""
+    try:
+        cantidad_btc = round(MONTO_USDT / precio_actual, 3)
+        tp_price = round(precio_actual * (1 + TP_PCT), 2)
+        sl_price = round(precio_actual * (1 - SL_PCT), 2)
+        
+        print(f"🚀 Ejecutando LONG: {cantidad_btc} BTC | Entrada: {precio_actual} | TP: {tp_price} | SL: {sl_price}")
+        
+        # Ajustar apalancamiento
+        try:
+            exchange.set_leverage(LEVERAGE, SYMBOL)
+        except Exception:
+            pass
+
+        # Orden de Mercado con TP y SL acoplados
+        params = {
+            'takeProfit': str(tp_price),
+            'stopLoss': str(sl_price)
+        }
+        
+        order = exchange.create_market_buy_order(SYMBOL, cantidad_btc, params)
+        print(f"✅ Orden ejecutada con éxito. ID: {order['id']}")
+    except Exception as e:
+        print(f"❌ Error al ejecutar la orden: {e}")
+
+# ------------------------------------------------------------------
+# BUCLE PRINCIPAL DE EJECUCIÓN (24/7)
+# ------------------------------------------------------------------
 def ejecutar_bot():
-    print("🤖 Iniciando hilo de ejecución del Bot...")
-    enviar_telegram("🚀 Bot de Trading en vivo iniciado correctamente.")
+    print("🤖 Bot de Trading activado en Render. Esperando condiciones de entrada...")
     
     while True:
         try:
-            df, precio_actual, var_24h = obtener_datos_mercado("BTCUSDT")
+            ahora = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+            df = obtener_datos_mercado()
             
-            if df is not None and not df.empty:
-                # Últimos valores calculados
-                cruz_ema_fast = df['ema_fast'].iloc[-1]
-                cruz_ema_slow = df['ema_slow'].iloc[-1]
-                cruz_ema_fast_prev = df['ema_fast'].iloc[-2]
-                cruz_ema_slow_prev = df['ema_slow'].iloc[-2]
+            if df is not None and len(df) > 0:
+                ultima = df.iloc[-1]
                 
-                rsi_actual = df['rsi'].iloc[-1]
-                adx_actual = df['adx'].iloc[-1]
+                # Evaluación de condiciones para Entrada LONG
+                long_signal = (
+                    (ultima['var_1h'] >= 1.0) and 
+                    (ultima['ema_fast'] > ultima['ema_slow']) and 
+                    (ultima['rsi'] > 50) and 
+                    (ultima['adx'] > 15)
+                )
                 
-                # Condición de Cruce Alcista (EMA 9 cruza hacia arriba EMA 21)
-                cruce_bullish = (cruz_ema_fast_prev <= cruz_ema_slow_prev) and (cruz_ema_fast > cruz_ema_slow)
+                posicion_activa = verificar_posicion_abierta()
                 
-                # Condición de Variación >= 2%
-                cumple_variacion = var_24h >= 2.0
+                print(f"[{ahora}] Precio: {ultima['close']} | Var 1h: {ultima['var_1h']:.2f}% | RSI: {ultima['rsi']:.1f} | Posición Activa: {posicion_activa}")
                 
-                # Evaluación general de entrada LONG
-                activa_long = cumple_variacion and cruce_bullish and (rsi_actual > 50) and (adx_actual > 20)
+                if long_signal and not posicion_activa:
+                    print("🎯 Señal detectada. Preparando orden...")
+                    ejecutar_orden_long(ultima['close'])
                 
-                # TABLERO DE CONTROL EN CONSOLA (Render Logs)
-                hora_actual = time.strftime("%H:%M:%S", time.localtime())
-                print("\n--------------------------------------------------")
-                print(f"⏰ Hora: {hora_actual} | BTC: ${precio_actual:,.2f}")
-                print(f"📈 Var. 24h: {var_24h:.2f}% (¿>= 2%?: {cumple_variacion})")
-                print(f"⚔️ Cruce Bullish: {cruce_bullish}")
-                print(f"📊 RSI: {rsi_actual:.1f} | ADX: {adx_actual:.1f}")
-                print(f"🎯 ¿Activa LONG?: {activa_long}")
-                print("--------------------------------------------------")
-                
-                # Ejecución de orden (Si cumple las condiciones)
-                if activa_long:
-                    msg = f"🔥 ¡SEÑAL LONG DETECTADA!\nBTC: ${precio_actual}\nVar 24h: {var_24h:.2f}%\nRSI: {rsi_actual:.1f} | ADX: {adx_actual:.1f}"
-                    print(msg)
-                    enviar_telegram(msg)
-                    # Aquí va la ejecución de la orden con Bybit si aplica
-                    
+            # Esperar 60 segundos antes de la siguiente verificación
+            time.sleep(60)
+            
         except Exception as e:
-            print(f"Error en el bucle principal: {e}")
-            
-        time.sleep(60) # Consulta cada 60 segundos
+            print(f"⚠️ Error general en el bucle: {e}")
+            time.sleep(30)
 
-# ==================================================
-# 5. INICIALIZACIÓN DE HILO Y SERVIDOR
-# ==================================================
-# Iniciar el bot en un hilo separado
-thread = threading.Thread(target=ejecutar_bot, daemon=True)
-thread.start()
-
-if __name__ == "__main__":
-    # Toma el puerto asignado por Render dinámicamente
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+if __name__ == '__main__':
+    ejecutar_bot()
