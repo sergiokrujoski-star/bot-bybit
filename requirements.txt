@@ -1,4 +1,5 @@
 ccxt
 pandas
-git+https://github.com/twopirllc/pandas-ta.git@development
+numpy
+ta
 python-dotenv
